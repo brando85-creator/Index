@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video AR</title>
+  <style>
+    :root { --bg:#0f1115; --panel:#1a1d24; --text:#e8eaf0; --muted:#9aa0ad; --accent:#4f8cff; --danger:#ff5d5d; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+    h1 { margin: 0 0 4px; font-size: 1.8rem; }
+    p.sub { margin: 0 0 20px; color: var(--muted); }
+    .card { background:var(--panel); border-radius:14px; padding:16px; margin-bottom:16px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; }
+    input[type=url] { flex:1; min-width:200px; padding:12px; border-radius:10px; border:1px solid #333; background:#0c0e12; color:var(--text); font-size:1rem; }
+    button, label.btn { padding:12px 18px; border-radius:10px; border:0; background:#2a2f3a; color:var(--text); font-size:1rem; cursor:pointer; display:inline-block; }
+    button.primary { background:var(--accent); color:#fff; font-weight:600; font-size:1.2rem; padding:16px 28px; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    input[type=file] { display:none; }
+    #list { list-style:none; padding:0; margin:0; display:grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap:10px; }
+    #list li { background:#0c0e12; border-radius:10px; overflow:hidden; position:relative; }
+    #list video { width:100%; aspect-ratio:16/9; object-fit:cover; display:block; background:#000; }
+    #list .name { font-size:.8rem; padding:6px 8px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #list .rm { position:absolute; top:6px; right:6px; padding:4px 9px; background:var(--danger); font-size:.85rem; }
+    #status { color:var(--muted); margin-top:10px; min-height:1.2em; }
+    .help li { margin:4px 0; color:var(--muted); }
+    .help b { color:var(--text); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Video AR</h1>
+  <p class="sub">Guarda i tuoi video su schermi virtuali nella tua stanza, con il Meta Quest 3.</p>
+
+  <div class="card">
+    <div class="row">
+      <label class="btn" for="files">📁 Scegli video dal visore</label>
+      <input id="files" type="file" accept="video/*" multiple>
+      <button id="clear">Svuota lista</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="url" type="url" placeholder="Oppure incolla il link diretto a un video (.mp4, .webm)">
+      <button id="addUrl">Aggiungi</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <ul id="list"></ul>
+  </div>
+
+  <div class="card" style="text-align:center">
+    <button id="enter" class="primary" disabled>Entra in AR</button>
+    <div id="xrStatus" style="margin-top:8px;color:var(--muted)"></div>
+  </div>
+
+  <div class="card help">
+    <strong>Comandi in AR</strong>
+    <ul>
+      <li><b>Grilletto / pizzico (tocco breve)</b> sullo schermo: play / pausa. L'audio passa al video che stai guardando.</li>
+      <li><b>Grilletto / pizzico (tieni premuto)</b>: afferra lo schermo e spostalo.</li>
+      <li><b>Levetta su/giù</b> mentre punti uno schermo: ingrandisci / rimpicciolisci.</li>
+      <li><b>Levetta sinistra/destra</b>: indietro / avanti di 10 secondi.</li>
+      <li><b>Tasto A o X</b>: rimetti tutti gli schermi davanti a te.</li>
+      <li><b>Tasto B o Y</b>: esci dall'AR.</li>
+    </ul>
+  </div>
+</main>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+const $ = (id) => document.getElementById(id);
+const listEl = $('list'), statusEl = $('status'), enterBtn = $('enter'), xrStatus = $('xrStatus');
+
+// ---------- Video library ----------
+const videos = []; // { id, name, el, url, isBlob, mesh?, frame? }
+let nextId = 1;
+
+function addVideo(src, name, isBlob) {
+  const el = document.createElement('video');
+  el.src = src;
+  el.crossOrigin = isBlob ? null : 'anonymous';
+  el.playsInline = true;
+  el.loop = true;
+  el.muted = true;
+  el.preload = 'auto';
+  const item = { id: nextId++, name, el, url: src, isBlob };
+  videos.push(item);
+  el.addEventListener('error', () => setStatus(`Impossibile caricare "${name}" (formato non supportato o link senza CORS).`));
+  // Show a first frame (Quest needs a play() to decode one)
+  el.play().then(() => el.pause()).catch(() => {});
+  renderList();
+  if (session) addScreen(item, true);
+}
+
+function removeVideo(id) {
+  const i = videos.findIndex(v => v.id === id);
+  if (i < 0) return;
+  const v = videos[i];
+  v.el.pause();
+  if (v.mesh) { scene.remove(v.mesh); v.mesh.material.map.dispose(); v.mesh.material.dispose(); }
+  if (v.isBlob) URL.revokeObjectURL(v.url);
+  videos.splice(i, 1);
+  renderList();
+}
+
+function renderList() {
+  listEl.innerHTML = '';
+  for (const v of videos) {
+    const li = document.createElement('li');
+    const preview = v.el; preview.controls = false;
+    li.appendChild(preview);
+    const n = document.createElement('div'); n.className = 'name'; n.textContent = v.name; li.appendChild(n);
+    const rm = document.createElement('button'); rm.className = 'rm'; rm.textContent = '✕';
+    rm.onclick = () => removeVideo(v.id); li.appendChild(rm);
+    listEl.appendChild(li);
+  }
+  enterBtn.disabled = !xrSupported || videos.length === 0;
+  setStatus(videos.length ? `${videos.length} video pronti.` : 'Nessun video caricato.');
+}
+
+function setStatus(t) { statusEl.textContent = t; }
+
+$('files').addEventListener('change', (e) => {
+  for (const f of e.target.files) addVideo(URL.createObjectURL(f), f.name, true);
+  e.target.value = '';
+});
+$('addUrl').addEventListener('click', () => {
+  const u = $('url').value.trim();
+  if (!u) return;
+  addVideo(u, u.split('/').pop().split('?')[0] || u, false);
+  $('url').value = '';
+});
+$('clear').addEventListener('click', () => { for (const v of [...videos]) removeVideo(v.id); });
+
+// ---------- Three.js / WebXR ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.setClearColor(0x000000, 0); // transparent => passthrough visible
+renderer.domElement.style.display = 'none';
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 100);
+scene.add(new THREE.AmbientLight(0xffffff, 1));
+
+let session = null, needLayout = false;
+let xrSupported = false;
+const raycaster = new THREE.Raycaster();
+const tmpMat = new THREE.Matrix4();
+
+const BASE_WIDTH = 1.4;     // metres
+const HIGHLIGHT = 0x4f8cff;
+
+function addScreen(item, placeInFront) {
+  const tex = new THREE.VideoTexture(item.el);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, toneMapped: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  const frame = new THREE.Mesh(new THREE.PlaneGeometry(1.04, 1.06),
+    new THREE.MeshBasicMaterial({ color: HIGHLIGHT, transparent: true, opacity: 0 }));
+  frame.position.z = -0.005;
+  mesh.add(frame);
+  mesh.userData = { item, frame, scale: 1 };
+  item.mesh = mesh;
+  const applyAspect = () => sizeScreen(mesh);
+  if (item.el.readyState >= 1) applyAspect(); else item.el.addEventListener('loadedmetadata', applyAspect, { once: true });
+  scene.add(mesh);
+  if (placeInFront) placeSingle(mesh);
+}
+
+function sizeScreen(mesh) {
+  const el = mesh.userData.item.el;
+  const aspect = (el.videoWidth && el.videoHeight) ? el.videoWidth / el.videoHeight : 16 / 9;
+  const w = BASE_WIDTH * mesh.userData.scale;
+  mesh.scale.set(w, w / aspect, 1);
+}
+
+function headPose() {
+  const xrCam = renderer.xr.getCamera();
+  const pos = new THREE.Vector3(), dir = new THREE.Vector3();
+  xrCam.getWorldPosition(pos);
+  xrCam.getWorldDirection(dir);
+  dir.y = 0; if (dir.lengthSq() < 1e-6) dir.set(0, 0, -1); dir.normalize();
+  return { pos, yaw: Math.atan2(dir.x, dir.z) };
+}
+
+// Arrange all screens on curved rows around the user
+function layoutAll() {
+  const meshes = videos.map(v => v.mesh).filter(Boolean);
+  if (!meshes.length) return;
+  const { pos, yaw } = headPose();
+  const radius = 2.6;
+  const perRow = Math.min(meshes.length, 5);
+  const rows = Math.ceil(meshes.length / perRow);
+  const stepAngle = (BASE_WIDTH + 0.25) / radius;
+  meshes.forEach((m, i) => {
+    m.userData.scale = 1; sizeScreen(m);
+    const row = Math.floor(i / perRow), col = i % perRow;
+    const inRow = Math.min(perRow, meshes.length - row * perRow);
+    const a = yaw + (col - (inRow - 1) / 2) * -stepAngle;
+    const y = pos.y + ((rows - 1) / 2 - row) * 0.95;
+    m.position.set(pos.x + Math.sin(a) * radius, y, pos.z + Math.cos(a) * radius);
+    m.lookAt(pos.x, y, pos.z);
+  });
+}
+
+function placeSingle(m) {
+  const { pos, yaw } = headPose();
+  m.position.set(pos.x + Math.sin(yaw) * 2, pos.y, pos.z + Math.cos(yaw) * 2);
+  m.lookAt(pos);
+}
+
+function faceUser(m) {
+  const { pos } = headPose();
+  const target = new THREE.Vector3(pos.x, m.position.y, pos.z);
+  m.lookAt(target);
+}
+
+function togglePlay(item) {
+  const el = item.el;
+  if (el.paused) {
+    // audio goes to the screen you start
+    for (const v of videos) if (v !== item) v.el.muted = true;
+    el.muted = false;
+    el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
+  } else {
+    el.pause();
+  }
+}
+
+// ---------- Controllers / hands ----------
+const controllers = [];
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+  const ray = new THREE.Line(rayGeo, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }));
+  ray.scale.z = 5;
+  c.add(ray);
+  c.userData = { ray, hover: null, grabbed: null, pressTime: 0, inputSource: null, stickCooldown: 0, prevButtons: [] };
+  c.addEventListener('connected', (e) => { c.userData.inputSource = e.data; ray.visible = e.data.targetRayMode !== 'gaze'; });
+  c.addEventListener('disconnected', () => { c.userData.inputSource = null; });
+  c.addEventListener('selectstart', () => onSelectStart(c));
+  c.addEventListener('selectend', () => onSelectEnd(c));
+  scene.add(c);
+  controllers.push(c);
+}
+
+function intersect(c) {
+  tmpMat.identity().extractRotation(c.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat);
+  const meshes = videos.map(v => v.mesh).filter(Boolean);
+  const hits = raycaster.intersectObjects(meshes, false);
+  return hits[0] || null;
+}
+
+function onSelectStart(c) {
+  const hit = intersect(c);
+  if (!hit) return;
+  c.userData.pressTime = performance.now();
+  c.userData.grabbed = hit.object;
+  c.userData.grabMoved = false;
+  c.userData.grabStartPos = hit.object.position.clone();
+  c.attach(hit.object); // follows the controller while held
+}
+
+function onSelectEnd(c) {
+  const m = c.userData.grabbed;
+  if (!m) return;
+  scene.attach(m);
+  c.userData.grabbed = null;
+  const short = performance.now() - c.userData.pressTime < 300;
+  const moved = m.position.distanceTo(c.userData.grabStartPos) > 0.05;
+  if (short && !moved) {
+    m.position.copy(c.userData.grabStartPos);
+    togglePlay(m.userData.item);
+  }
+  faceUser(m);
+}
+
+function pollGamepad(c, dt) {
+  const src = c.userData.inputSource;
+  const gp = src && src.gamepad;
+  if (!gp) return;
+  const target = c.userData.grabbed || c.userData.hover;
+  const ax = gp.axes[2] || 0, ay = gp.axes[3] || 0;
+  if (target) {
+    if (Math.abs(ay) > 0.2) {
+      target.userData.scale = THREE.MathUtils.clamp(target.userData.scale * (1 - ay * dt * 1.2), 0.3, 4);
+      sizeScreen(target);
+    }
+    c.userData.stickCooldown -= dt;
+    if (Math.abs(ax) > 0.7 && c.userData.stickCooldown <= 0) {
+      const el = target.userData.item.el;
+      if (isFinite(el.duration)) el.currentTime = THREE.MathUtils.clamp(el.currentTime + Math.sign(ax) * 10, 0, el.duration);
+      c.userData.stickCooldown = 0.4;
+    }
+  }
+  // A/X = buttons[4], B/Y = buttons[5]
+  const pressed = (i) => gp.buttons[i] && gp.buttons[i].pressed;
+  const was = c.userData.prevButtons;
+  if (pressed(4) && !was[4]) layoutAll();
+  if (pressed(5) && !was[5]) session && session.end();
+  c.userData.prevButtons = gp.buttons.map(b => b.pressed);
+}
+
+// ---------- Session ----------
+async function checkSupport() {
+  if (!navigator.xr) { xrStatus.textContent = 'WebXR non disponibile: apri questa pagina nel browser del Meta Quest 3.'; return; }
+  try {
+    xrSupported = await navigator.xr.isSessionSupported('immersive-ar');
+    xrStatus.textContent = xrSupported ? '' : 'La realtà aumentata non è supportata su questo dispositivo. Usa il browser del Quest 3.';
+  } catch { xrStatus.textContent = 'Impossibile verificare il supporto WebXR.'; }
+  renderList();
+}
+
+enterBtn.addEventListener('click', async () => {
+  try {
+    const s = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['hand-tracking'],
+    });
+    session = s;
+    await renderer.xr.setSession(s);
+    for (const v of videos) if (!v.mesh) addScreen(v, false);
+    needLayout = true;
+    s.addEventListener('end', () => {
+      session = null;
+      for (const v of videos) v.el.pause();
+    });
+  } catch (err) {
+    xrStatus.textContent = 'Impossibile avviare l\'AR: ' + err.message;
+  }
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!session) return;
+  if (needLayout) { needLayout = false; layoutAll(); }
+  for (const v of videos) if (v.mesh) {
+    v.mesh.userData.frame.material.opacity = 0;
+    v.mesh.material.color.setScalar(v.el.paused ? 0.6 : 1); // dim when paused
+  }
+  for (const c of controllers) {
+    const hit = c.userData.grabbed ? null : intersect(c);
+    c.userData.hover = hit ? hit.object : null;
+    c.userData.ray.scale.z = hit ? hit.distance : 5;
+    const active = c.userData.grabbed || c.userData.hover;
+    if (active) active.userData.frame.material.opacity = c.userData.grabbed ? 0.9 : 0.6;
+    pollGamepad(c, dt);
+  }
+  renderer.render(scene, camera);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+checkSupport();
+</script>
+</body>
+</html>
